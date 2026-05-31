@@ -16,9 +16,14 @@ WG_ENDPOINT_PORT=""
 TECHNITIUM_IP=""
 LAN_BRIDGE="br-lan"
 WG_IF="wg-yt"
+ROUTER_DNS_IP=""               # router LAN DNS IP; auto-detected from LAN_BRIDGE if empty
+
+WG_MTU="1380"
+WG_KEEPALIVE="25"
 
 RT_TABLE_NAME="wgroute"
 RT_TABLE_ID="200"
+RULE_PRIORITY="200"            # ip rule priority for the fwmark policy rule
 FWMARK="0x200"
 
 YT_SET="yt-vpn"
@@ -38,6 +43,31 @@ die()  { err "$*"; exit 1; }
 
 need_root() {
   [ "$(id -u)" = "0" ] || die "Run as root."
+}
+
+check_deps() {
+  for cmd in ipset iptables wg uci awk; do
+    command -v "$cmd" >/dev/null 2>&1 || die "Required command not found: $cmd"
+  done
+
+  modprobe wireguard 2>/dev/null || true
+  if [ ! -d /sys/module/wireguard ] && ! grep -qw wireguard /proc/modules 2>/dev/null; then
+    if ip link add dev wgprobe$$ type wireguard 2>/dev/null; then
+      ip link del wgprobe$$ 2>/dev/null || true
+    else
+      die "WireGuard kernel support not available (modprobe wireguard failed)."
+    fi
+  fi
+
+  # dnsmasq must be built with ipset support (dnsmasq-full); plain dnsmasq
+  # silently ignores the ipset= directive and yt-vpn never populates.
+  if dnsmasq --version 2>/dev/null | grep -qi 'no-ipset'; then
+    die "Installed dnsmasq lacks ipset support (need dnsmasq-full)."
+  fi
+}
+
+detect_router_ip() {
+  ip -4 addr show "$LAN_BRIDGE" 2>/dev/null | awk '/inet /{sub("/.*","",$2); print $2; exit}'
 }
 
 find_dnsmasq_section() {
@@ -74,9 +104,10 @@ validate_port() {
 }
 
 status_dns() {
-  if nslookup youtube.com 192.168.1.1 >/dev/null 2>&1; then
-    echo "YES (query to 192.168.1.1 succeeded)"
-  elif nslookup youtube.com 127.0.0.1 >/dev/null 2>&1; then
+  router_ip="${ROUTER_DNS_IP:-$(detect_router_ip)}"
+  if [ -n "$router_ip" ] && nslookup youtubei.googleapis.com "$router_ip" >/dev/null 2>&1; then
+    echo "YES (query to $router_ip succeeded)"
+  elif nslookup youtubei.googleapis.com 127.0.0.1 >/dev/null 2>&1; then
     echo "YES (query to 127.0.0.1 succeeded)"
   else
     echo "NO (query failed)"
@@ -148,9 +179,14 @@ save_current_cache() {
 restore_cache() {
   [ -f "$YT_BACKUP_FILE" ] || return 0
   ipset create "$YT_SET" hash:ip maxelem 65536 -exist
-  grep '^add '"$YT_SET"' ' "$YT_BACKUP_FILE" | while read _ _ ip; do
-    ipset add "$YT_SET" "$ip" -exist
-  done
+  # Fast path: ipset restore consumes the `ipset save` format directly.
+  # -! tolerates the existing set/entries; fall back to a per-entry loop
+  # if the dump format is rejected.
+  if ! ipset restore -! < "$YT_BACKUP_FILE" 2>/dev/null; then
+    grep '^add '"$YT_SET"' ' "$YT_BACKUP_FILE" | while read _ _ ip; do
+      ipset add "$YT_SET" "$ip" -exist
+    done
+  fi
 }
 
 ensure_rt_table() {
@@ -200,9 +236,9 @@ ensure_wg() {
 
   ip addr flush dev "$WG_IF"
   ip addr add "$WG_ADDR" dev "$WG_IF"
-  ip link set dev "$WG_IF" mtu 1380
+  ip link set dev "$WG_IF" mtu "$WG_MTU"
   ip link set up dev "$WG_IF"
-  wg set "$WG_IF" peer "$WG_SERVER_PUBKEY" persistent-keepalive 25
+  wg set "$WG_IF" peer "$WG_SERVER_PUBKEY" persistent-keepalive "$WG_KEEPALIVE"
 }
 
 ensure_dnsmasq_config() {
@@ -242,14 +278,16 @@ iptables -D FORWARD -i $WG_IF -j ACCEPT 2>/dev/null || true
 iptables -I FORWARD -o $WG_IF -j ACCEPT
 iptables -I FORWARD -i $WG_IF -j ACCEPT
 
+# Append our two mangle rules after any existing PREROUTING rules so the
+# router's own firewall rules keep their precedence. The RETURN (exclude)
+# rule must sit immediately above the MARK rule, so append RETURN first.
 iptables -t mangle -D PREROUTING -i $LAN_BRIDGE -m set --match-set $EXCLUDE_SET src -m set --match-set $YT_SET dst -j RETURN 2>/dev/null || true
-iptables -t mangle -I PREROUTING 1 -i $LAN_BRIDGE -m set --match-set $EXCLUDE_SET src -m set --match-set $YT_SET dst -j RETURN
-
 iptables -t mangle -D PREROUTING -i $LAN_BRIDGE -m set --match-set $YT_SET dst -j MARK --set-mark $FWMARK 2>/dev/null || true
+iptables -t mangle -A PREROUTING -i $LAN_BRIDGE -m set --match-set $EXCLUDE_SET src -m set --match-set $YT_SET dst -j RETURN
 iptables -t mangle -A PREROUTING -i $LAN_BRIDGE -m set --match-set $YT_SET dst -j MARK --set-mark $FWMARK
 
 ip rule del fwmark $FWMARK table $RT_TABLE_NAME 2>/dev/null || true
-ip rule add fwmark $FWMARK table $RT_TABLE_NAME priority $RT_TABLE_ID
+ip rule add fwmark $FWMARK table $RT_TABLE_NAME priority $RULE_PRIORITY
 
 ip route flush table $RT_TABLE_NAME 2>/dev/null || true
 ip route replace default dev $WG_IF table $RT_TABLE_NAME
@@ -275,6 +313,7 @@ ensure_firewall_user() {
 }
 
 full_setup() {
+  check_deps
   save_current_cache
   ensure_wg
   ensure_rt_table

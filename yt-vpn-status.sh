@@ -27,7 +27,7 @@ else
 fi
 
 # --- dnsmasq UCI section name ---
-DNSMASQ_SEC="$(uci show dhcp 2>/dev/null | awk -F= '/=dnsmasq/{print $1; exit}')"
+DNSMASQ_SEC="$(uci show dhcp 2>/dev/null | awk -F= '/=dnsmasq$/{print $1; exit}')"
 if [ -z "$DNSMASQ_SEC" ]; then
   hr
   echo "[dnsmasq]"
