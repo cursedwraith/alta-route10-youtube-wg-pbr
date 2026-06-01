@@ -258,8 +258,20 @@ ensure_dnsmasq_config() {
   uci add_list "$DNSMASQ_SECTION".server="$TECHNITIUM_IP"
 
   uci del "$DNSMASQ_SECTION".ipset 2>/dev/null || true
+  # Media CDN: the actual videoplayback audio/video streams.
   uci add_list "$DNSMASQ_SECTION".ipset='/googlevideo.com/yt-vpn'
+  # InnerTube player API used by the mobile/TV/embedded clients.
   uci add_list "$DNSMASQ_SECTION".ipset='/youtubei.googleapis.com/yt-vpn'
+  # Web front-end + player config. The request that MINTS the IP-locked
+  # videoplayback URLs (www.youtube.com/youtubei/v1/player on desktop) must
+  # egress the SAME VPN IP as the media, or the signed ip= in those URLs
+  # won't match the stream source and Google throttles/redirects.
+  # dnsmasq matches by suffix, so /youtube.com/ also covers www. and m.
+  uci add_list "$DNSMASQ_SECTION".ipset='/youtube.com/yt-vpn'
+  uci add_list "$DNSMASQ_SECTION".ipset='/youtube-nocookie.com/yt-vpn'
+  # Static assets (thumbnails, avatars) — optional, for a fully coherent path.
+  uci add_list "$DNSMASQ_SECTION".ipset='/ytimg.com/yt-vpn'
+  uci add_list "$DNSMASQ_SECTION".ipset='/ggpht.com/yt-vpn'
 
   uci commit dhcp
   /etc/init.d/dnsmasq restart
@@ -286,6 +298,14 @@ iptables -D FORWARD -o $WG_IF -j ACCEPT 2>/dev/null || true
 iptables -D FORWARD -i $WG_IF -j ACCEPT 2>/dev/null || true
 iptables -I FORWARD -o $WG_IF -j ACCEPT
 iptables -I FORWARD -i $WG_IF -j ACCEPT
+
+# Clamp TCP MSS to the tunnel path MTU so large segments don't get dropped
+# (PMTU black-holes are a common cause of YouTube buffering over a tunnel).
+# QUIC/HTTP3 (UDP 443) does its own PMTU discovery and is unaffected.
+iptables -t mangle -D FORWARD -o $WG_IF -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+iptables -t mangle -D FORWARD -i $WG_IF -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+iptables -t mangle -A FORWARD -o $WG_IF -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+iptables -t mangle -A FORWARD -i $WG_IF -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
 # Append our two mangle rules after any existing PREROUTING rules so the
 # router's own firewall rules keep their precedence. The RETURN (exclude)
