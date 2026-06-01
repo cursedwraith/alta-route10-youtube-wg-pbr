@@ -86,6 +86,7 @@ validate_ipv4() {
 }
 
 validate_cidr() {
+  local addr mask
   case "$1" in
     */*)
       addr=${1%/*}
@@ -104,6 +105,7 @@ validate_port() {
 }
 
 status_dns() {
+  local router_ip
   router_ip="${ROUTER_DNS_IP:-$(detect_router_ip)}"
   if [ -n "$router_ip" ] && nslookup youtubei.googleapis.com "$router_ip" >/dev/null 2>&1; then
     echo "YES (query to $router_ip succeeded)"
@@ -171,9 +173,12 @@ is_configured() {
 }
 
 save_current_cache() {
-  if ipset list "$YT_SET" >/dev/null 2>&1; then
-    ipset save "$YT_SET" > "$YT_BACKUP_FILE" || true
-  fi
+  local cnt
+  ipset list "$YT_SET" >/dev/null 2>&1 || return 0
+  cnt="$(ipset list "$YT_SET" | awk '/^Number of entries:/{print $4}')"
+  # Don't overwrite a good backup with an empty/flushed set.
+  [ "${cnt:-0}" -gt 0 ] 2>/dev/null || return 0
+  ipset save "$YT_SET" > "$YT_BACKUP_FILE" || true
 }
 
 restore_cache() {
@@ -192,9 +197,13 @@ restore_cache() {
 ensure_rt_table() {
   grep -q "^$RT_TABLE_ID[[:space:]]\+$RT_TABLE_NAME$" /etc/iproute2/rt_tables 2>/dev/null || \
     echo "$RT_TABLE_ID $RT_TABLE_NAME" >> /etc/iproute2/rt_tables
+}
 
-  ip route flush table "$RT_TABLE_NAME" 2>/dev/null || true
-  ip route replace default dev "$WG_IF" table "$RT_TABLE_NAME"
+ensure_ipsets() {
+  # Create the sets up front so dnsmasq has somewhere to add resolved IPs as
+  # soon as it restarts; firewall.user re-creates them with -exist on boot.
+  ipset create "$YT_SET" hash:ip maxelem 65536 -exist
+  ipset create "$EXCLUDE_SET" hash:ip maxelem 128 -exist
 }
 
 ensure_wg() {
@@ -286,7 +295,7 @@ iptables -t mangle -D PREROUTING -i $LAN_BRIDGE -m set --match-set $YT_SET dst -
 iptables -t mangle -A PREROUTING -i $LAN_BRIDGE -m set --match-set $EXCLUDE_SET src -m set --match-set $YT_SET dst -j RETURN
 iptables -t mangle -A PREROUTING -i $LAN_BRIDGE -m set --match-set $YT_SET dst -j MARK --set-mark $FWMARK
 
-ip rule del fwmark $FWMARK table $RT_TABLE_NAME 2>/dev/null || true
+while ip rule del fwmark $FWMARK table $RT_TABLE_NAME 2>/dev/null; do :; done
 ip rule add fwmark $FWMARK table $RT_TABLE_NAME priority $RULE_PRIORITY
 
 ip route flush table $RT_TABLE_NAME 2>/dev/null || true
@@ -296,6 +305,7 @@ EOF
 }
 
 ensure_firewall_user() {
+  local tmp
   tmp="$(mktemp)"
   if [ -f /etc/firewall.user ]; then
     awk -v begin="$FWU_BEGIN" -v end="$FWU_END" '
@@ -317,6 +327,7 @@ full_setup() {
   save_current_cache
   ensure_wg
   ensure_rt_table
+  ensure_ipsets
   ensure_dnsmasq_config
   ensure_firewall_user
   restore_cache
@@ -325,6 +336,7 @@ full_setup() {
 }
 
 main() {
+  local ans
   need_root
   DNSMASQ_SECTION="$(find_dnsmasq_section)"
   [ -n "$DNSMASQ_SECTION" ] || die "Could not find dnsmasq UCI section."
@@ -333,19 +345,15 @@ main() {
 
   if is_configured; then
     printf "Do you want to reconfigure it now? [y/N] "
-    read ans
-    case "$ans" in
-      y|Y|yes|YES) full_setup ;;
-      *) info "No changes made." ;;
-    esac
   else
     printf "Do you want to configure it now? [y/N] "
-    read ans
-    case "$ans" in
-      y|Y|yes|YES) full_setup ;;
-      *) info "No changes made." ;;
-    esac
   fi
+
+  read ans || ans=""
+  case "$ans" in
+    y|Y|yes|YES) full_setup ;;
+    *) info "No changes made." ;;
+  esac
 }
 
 main "$@"
