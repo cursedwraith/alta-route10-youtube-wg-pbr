@@ -66,27 +66,30 @@ Excluded client -> Alta Route10 -> WAN
 
 ## Default YouTube Domains
 
-The default script uses a conservative set:
+The script populates `yt-vpn` from these domains (dnsmasq matches by suffix,
+so each entry also covers its subdomains):
 
 ```text
-googlevideo.com
-youtubei.googleapis.com
+googlevideo.com          # media streams (videoplayback)
+youtubei.googleapis.com  # InnerTube player API (apps/TV/embeds)
+youtube.com              # web front-end + player config (covers www. and m.)
+youtube-nocookie.com     # privacy-enhanced embeds
+ytimg.com                # thumbnails / static assets
+ggpht.com                # avatars / static assets
 ```
 
-These are used to populate:
+`youtube.com` matters for more than convenience: on the desktop web client
+the player request that **mints the IP-locked `videoplayback` URLs** goes to
+`www.youtube.com/youtubei/v1/player`. If that request does not egress the
+same VPN IP as the media, the signed `ip=` baked into the stream URLs won't
+match the source address and Google throttles/redirects the stream
+(`ipbypass=yes`, `cms_redirect=yes`), causing buffering.
 
-```text
-yt-vpn
-```
-
-Optional broader domains can be added, but may cause more Google traffic to go through the VPN:
-
-```text
-youtube.com
-youtu.be
-ytimg.com
-yt3.ggpht.com
-```
+Trade-off: routing `youtube.com` over the VPN sends all YouTube web traffic
+(including sign-in) through the tunnel, so a flagged/datacenter VPN exit IP
+may trigger "sign in to confirm you're not a bot" prompts. To revert to the
+conservative media-only set, remove the `youtube.com`/`ytimg.com`/`ggpht.com`
+lines from `ensure_dnsmasq_config`.
 
 ---
 

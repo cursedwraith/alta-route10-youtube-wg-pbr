@@ -16,9 +16,14 @@ WG_ENDPOINT_PORT=""
 TECHNITIUM_IP=""
 LAN_BRIDGE="br-lan"
 WG_IF="wg-yt"
+ROUTER_DNS_IP=""               # router LAN DNS IP; auto-detected from LAN_BRIDGE if empty
+
+WG_MTU="1440"                  # tunnel MTU; 1440 suits a 1500 (baby-jumbo) PPPoE WAN (1500-60). Use 1432 on a 1492 WAN.
+WG_KEEPALIVE="25"
 
 RT_TABLE_NAME="wgroute"
 RT_TABLE_ID="200"
+RULE_PRIORITY="200"            # ip rule priority for the fwmark policy rule
 FWMARK="0x200"
 
 YT_SET="yt-vpn"
@@ -40,6 +45,31 @@ need_root() {
   [ "$(id -u)" = "0" ] || die "Run as root."
 }
 
+check_deps() {
+  for cmd in ipset iptables wg uci awk; do
+    command -v "$cmd" >/dev/null 2>&1 || die "Required command not found: $cmd"
+  done
+
+  modprobe wireguard 2>/dev/null || true
+  if [ ! -d /sys/module/wireguard ] && ! grep -qw wireguard /proc/modules 2>/dev/null; then
+    if ip link add dev wgprobe$$ type wireguard 2>/dev/null; then
+      ip link del wgprobe$$ 2>/dev/null || true
+    else
+      die "WireGuard kernel support not available (modprobe wireguard failed)."
+    fi
+  fi
+
+  # dnsmasq must be built with ipset support (dnsmasq-full); plain dnsmasq
+  # silently ignores the ipset= directive and yt-vpn never populates.
+  if dnsmasq --version 2>/dev/null | grep -qi 'no-ipset'; then
+    die "Installed dnsmasq lacks ipset support (need dnsmasq-full)."
+  fi
+}
+
+detect_router_ip() {
+  ip -4 addr show "$LAN_BRIDGE" 2>/dev/null | awk '/inet /{sub("/.*","",$2); print $2; exit}'
+}
+
 find_dnsmasq_section() {
   uci show dhcp 2>/dev/null | awk -F= '/=dnsmasq$/{print $1; exit}'
 }
@@ -56,6 +86,7 @@ validate_ipv4() {
 }
 
 validate_cidr() {
+  local addr mask
   case "$1" in
     */*)
       addr=${1%/*}
@@ -74,9 +105,11 @@ validate_port() {
 }
 
 status_dns() {
-  if nslookup youtube.com 192.168.1.1 >/dev/null 2>&1; then
-    echo "YES (query to 192.168.1.1 succeeded)"
-  elif nslookup youtube.com 127.0.0.1 >/dev/null 2>&1; then
+  local router_ip
+  router_ip="${ROUTER_DNS_IP:-$(detect_router_ip)}"
+  if [ -n "$router_ip" ] && nslookup youtubei.googleapis.com "$router_ip" >/dev/null 2>&1; then
+    echo "YES (query to $router_ip succeeded)"
+  elif nslookup youtubei.googleapis.com 127.0.0.1 >/dev/null 2>&1; then
     echo "YES (query to 127.0.0.1 succeeded)"
   else
     echo "NO (query failed)"
@@ -140,25 +173,37 @@ is_configured() {
 }
 
 save_current_cache() {
-  if ipset list "$YT_SET" >/dev/null 2>&1; then
-    ipset save "$YT_SET" > "$YT_BACKUP_FILE" || true
-  fi
+  local cnt
+  ipset list "$YT_SET" >/dev/null 2>&1 || return 0
+  cnt="$(ipset list "$YT_SET" | awk '/^Number of entries:/{print $4}')"
+  # Don't overwrite a good backup with an empty/flushed set.
+  [ "${cnt:-0}" -gt 0 ] 2>/dev/null || return 0
+  ipset save "$YT_SET" > "$YT_BACKUP_FILE" || true
 }
 
 restore_cache() {
   [ -f "$YT_BACKUP_FILE" ] || return 0
   ipset create "$YT_SET" hash:ip maxelem 65536 -exist
-  grep '^add '"$YT_SET"' ' "$YT_BACKUP_FILE" | while read _ _ ip; do
-    ipset add "$YT_SET" "$ip" -exist
-  done
+  # Fast path: ipset restore consumes the `ipset save` format directly.
+  # -! tolerates the existing set/entries; fall back to a per-entry loop
+  # if the dump format is rejected.
+  if ! ipset restore -! < "$YT_BACKUP_FILE" 2>/dev/null; then
+    grep '^add '"$YT_SET"' ' "$YT_BACKUP_FILE" | while read _ _ ip; do
+      ipset add "$YT_SET" "$ip" -exist
+    done
+  fi
 }
 
 ensure_rt_table() {
   grep -q "^$RT_TABLE_ID[[:space:]]\+$RT_TABLE_NAME$" /etc/iproute2/rt_tables 2>/dev/null || \
     echo "$RT_TABLE_ID $RT_TABLE_NAME" >> /etc/iproute2/rt_tables
+}
 
-  ip route flush table "$RT_TABLE_NAME" 2>/dev/null || true
-  ip route replace default dev "$WG_IF" table "$RT_TABLE_NAME"
+ensure_ipsets() {
+  # Create the sets up front so dnsmasq has somewhere to add resolved IPs as
+  # soon as it restarts; firewall.user re-creates them with -exist on boot.
+  ipset create "$YT_SET" hash:ip maxelem 65536 -exist
+  ipset create "$EXCLUDE_SET" hash:ip maxelem 128 -exist
 }
 
 ensure_wg() {
@@ -200,9 +245,9 @@ ensure_wg() {
 
   ip addr flush dev "$WG_IF"
   ip addr add "$WG_ADDR" dev "$WG_IF"
-  ip link set dev "$WG_IF" mtu 1380
+  ip link set dev "$WG_IF" mtu "$WG_MTU"
   ip link set up dev "$WG_IF"
-  wg set "$WG_IF" peer "$WG_SERVER_PUBKEY" persistent-keepalive 25
+  wg set "$WG_IF" peer "$WG_SERVER_PUBKEY" persistent-keepalive "$WG_KEEPALIVE"
 }
 
 ensure_dnsmasq_config() {
@@ -213,8 +258,20 @@ ensure_dnsmasq_config() {
   uci add_list "$DNSMASQ_SECTION".server="$TECHNITIUM_IP"
 
   uci del "$DNSMASQ_SECTION".ipset 2>/dev/null || true
+  # Media CDN: the actual videoplayback audio/video streams.
   uci add_list "$DNSMASQ_SECTION".ipset='/googlevideo.com/yt-vpn'
+  # InnerTube player API used by the mobile/TV/embedded clients.
   uci add_list "$DNSMASQ_SECTION".ipset='/youtubei.googleapis.com/yt-vpn'
+  # Web front-end + player config. The request that MINTS the IP-locked
+  # videoplayback URLs (www.youtube.com/youtubei/v1/player on desktop) must
+  # egress the SAME VPN IP as the media, or the signed ip= in those URLs
+  # won't match the stream source and Google throttles/redirects.
+  # dnsmasq matches by suffix, so /youtube.com/ also covers www. and m.
+  uci add_list "$DNSMASQ_SECTION".ipset='/youtube.com/yt-vpn'
+  uci add_list "$DNSMASQ_SECTION".ipset='/youtube-nocookie.com/yt-vpn'
+  # Static assets (thumbnails, avatars) — optional, for a fully coherent path.
+  uci add_list "$DNSMASQ_SECTION".ipset='/ytimg.com/yt-vpn'
+  uci add_list "$DNSMASQ_SECTION".ipset='/ggpht.com/yt-vpn'
 
   uci commit dhcp
   /etc/init.d/dnsmasq restart
@@ -242,14 +299,24 @@ iptables -D FORWARD -i $WG_IF -j ACCEPT 2>/dev/null || true
 iptables -I FORWARD -o $WG_IF -j ACCEPT
 iptables -I FORWARD -i $WG_IF -j ACCEPT
 
-iptables -t mangle -D PREROUTING -i $LAN_BRIDGE -m set --match-set $EXCLUDE_SET src -m set --match-set $YT_SET dst -j RETURN 2>/dev/null || true
-iptables -t mangle -I PREROUTING 1 -i $LAN_BRIDGE -m set --match-set $EXCLUDE_SET src -m set --match-set $YT_SET dst -j RETURN
+# Clamp TCP MSS to the tunnel path MTU so large segments don't get dropped
+# (PMTU black-holes are a common cause of YouTube buffering over a tunnel).
+# QUIC/HTTP3 (UDP 443) does its own PMTU discovery and is unaffected.
+iptables -t mangle -D FORWARD -o $WG_IF -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+iptables -t mangle -D FORWARD -i $WG_IF -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+iptables -t mangle -A FORWARD -o $WG_IF -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+iptables -t mangle -A FORWARD -i $WG_IF -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
+# Append our two mangle rules after any existing PREROUTING rules so the
+# router's own firewall rules keep their precedence. The RETURN (exclude)
+# rule must sit immediately above the MARK rule, so append RETURN first.
+iptables -t mangle -D PREROUTING -i $LAN_BRIDGE -m set --match-set $EXCLUDE_SET src -m set --match-set $YT_SET dst -j RETURN 2>/dev/null || true
 iptables -t mangle -D PREROUTING -i $LAN_BRIDGE -m set --match-set $YT_SET dst -j MARK --set-mark $FWMARK 2>/dev/null || true
+iptables -t mangle -A PREROUTING -i $LAN_BRIDGE -m set --match-set $EXCLUDE_SET src -m set --match-set $YT_SET dst -j RETURN
 iptables -t mangle -A PREROUTING -i $LAN_BRIDGE -m set --match-set $YT_SET dst -j MARK --set-mark $FWMARK
 
-ip rule del fwmark $FWMARK table $RT_TABLE_NAME 2>/dev/null || true
-ip rule add fwmark $FWMARK table $RT_TABLE_NAME priority $RT_TABLE_ID
+while ip rule del fwmark $FWMARK table $RT_TABLE_NAME 2>/dev/null; do :; done
+ip rule add fwmark $FWMARK table $RT_TABLE_NAME priority $RULE_PRIORITY
 
 ip route flush table $RT_TABLE_NAME 2>/dev/null || true
 ip route replace default dev $WG_IF table $RT_TABLE_NAME
@@ -258,6 +325,7 @@ EOF
 }
 
 ensure_firewall_user() {
+  local tmp
   tmp="$(mktemp)"
   if [ -f /etc/firewall.user ]; then
     awk -v begin="$FWU_BEGIN" -v end="$FWU_END" '
@@ -275,9 +343,11 @@ ensure_firewall_user() {
 }
 
 full_setup() {
+  check_deps
   save_current_cache
   ensure_wg
   ensure_rt_table
+  ensure_ipsets
   ensure_dnsmasq_config
   ensure_firewall_user
   restore_cache
@@ -286,6 +356,7 @@ full_setup() {
 }
 
 main() {
+  local ans
   need_root
   DNSMASQ_SECTION="$(find_dnsmasq_section)"
   [ -n "$DNSMASQ_SECTION" ] || die "Could not find dnsmasq UCI section."
@@ -294,19 +365,15 @@ main() {
 
   if is_configured; then
     printf "Do you want to reconfigure it now? [y/N] "
-    read ans
-    case "$ans" in
-      y|Y|yes|YES) full_setup ;;
-      *) info "No changes made." ;;
-    esac
   else
     printf "Do you want to configure it now? [y/N] "
-    read ans
-    case "$ans" in
-      y|Y|yes|YES) full_setup ;;
-      *) info "No changes made." ;;
-    esac
   fi
+
+  read ans || ans=""
+  case "$ans" in
+    y|Y|yes|YES) full_setup ;;
+    *) info "No changes made." ;;
+  esac
 }
 
 main "$@"

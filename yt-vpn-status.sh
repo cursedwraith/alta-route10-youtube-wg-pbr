@@ -18,16 +18,27 @@ echo
 # --- Router DNS listener ---
 hr
 echo "[DNS: Router listener]"
-DNS_LISTEN="$(ss -lunp 2>/dev/null | awk '$5 ~ /:53$/ {print}' | head -n 5)"
+ROUTER_IP="$(ip -4 addr show "$LAN_BRIDGE" 2>/dev/null | awk '/inet /{sub("/.*","",$2); print $2; exit}')"
+# Match the local listening socket regardless of ss column layout: the peer
+# column is always 0.0.0.0:* so :53 only appears on the local address side.
+DNS_LISTEN="$(ss -lunp 2>/dev/null | grep -E ':53([[:space:]]|$)' | head -n 5)"
+
+# Functional test is authoritative; ss column layout varies by build.
+if nslookup youtubei.googleapis.com "${ROUTER_IP:-127.0.0.1}" >/dev/null 2>&1; then
+  kv "Router DNS resolves" "YES (via ${ROUTER_IP:-127.0.0.1})"
+else
+  kv "Router DNS resolves" "NO (query to ${ROUTER_IP:-127.0.0.1} failed)"
+fi
+
 if [ -n "$DNS_LISTEN" ]; then
   kv "Router UDP :53 listener" "YES"
   echo "$DNS_LISTEN" | sed 's/^/  /'
 else
-  kv "Router UDP :53 listener" "NO (dnsmasq may be down)"
+  kv "Router UDP :53 listener" "not detected via ss (functional test above is authoritative)"
 fi
 
 # --- dnsmasq UCI section name ---
-DNSMASQ_SEC="$(uci show dhcp 2>/dev/null | awk -F= '/=dnsmasq/{print $1; exit}')"
+DNSMASQ_SEC="$(uci show dhcp 2>/dev/null | awk -F= '/=dnsmasq$/{print $1; exit}')"
 if [ -z "$DNSMASQ_SEC" ]; then
   hr
   echo "[dnsmasq]"
