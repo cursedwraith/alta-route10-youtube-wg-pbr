@@ -18,7 +18,7 @@ LAN_BRIDGE="br-lan"
 WG_IF="wg-yt"
 ROUTER_DNS_IP=""               # router LAN DNS IP; auto-detected from LAN_BRIDGE if empty
 
-WG_MTU="1380"
+WG_MTU="1440"                  # tunnel MTU; 1440 suits a 1500 (baby-jumbo) PPPoE WAN (1500-60). Use 1432 on a 1492 WAN.
 WG_KEEPALIVE="25"
 
 RT_TABLE_NAME="wgroute"
