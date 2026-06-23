@@ -83,14 +83,16 @@ find_dnsmasq_section() {
 }
 
 validate_ipv4() {
-  echo "$1" | awk -F. '
-    NF!=4 {exit 1}
-    {
-      for(i=1;i<=4;i++) {
-        if($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) exit 1
-      }
-    }
-    END{exit 0}'
+  # All logic in BEGIN with a single exit path. A previous version used an
+  # END{exit 0} block, which in awk overrides any exit 1 from the body, so the
+  # check always passed (an empty IP then wiped the dnsmasq upstream).
+  awk -v s="$1" '
+    BEGIN {
+      if (split(s, a, ".") != 4) exit 1
+      for (i = 1; i <= 4; i++)
+        if (a[i] !~ /^[0-9]+$/ || a[i] + 0 > 255) exit 1
+      exit 0
+    }'
 }
 
 validate_cidr() {
@@ -400,8 +402,20 @@ ensure_firewall_user() {
   /etc/init.d/firewall restart
 }
 
+validate_config() {
+  # Validate everything BEFORE any change, so an incomplete config can never
+  # half-apply and leave the router (e.g. its DNS) broken.
+  validate_ipv4 "$TECHNITIUM_IP" || die "TECHNITIUM_IP is invalid or empty: '$TECHNITIUM_IP'"
+  [ -n "$WG_PRIVKEY" ]       || die "WG_PRIVKEY is empty."
+  [ -n "$WG_SERVER_PUBKEY" ] || die "WG_SERVER_PUBKEY is empty."
+  [ -n "$WG_ENDPOINT_HOST" ] || die "WG_ENDPOINT_HOST is empty."
+  validate_cidr "$WG_ADDR"        || die "WG_ADDR is invalid: '$WG_ADDR'"
+  validate_port "$WG_ENDPOINT_PORT" || die "WG_ENDPOINT_PORT is invalid: '$WG_ENDPOINT_PORT'"
+}
+
 full_setup() {
   check_deps
+  validate_config
   save_current_cache
   ensure_wg
   ensure_rt_table
