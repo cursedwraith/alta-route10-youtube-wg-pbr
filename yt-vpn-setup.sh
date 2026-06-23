@@ -18,6 +18,11 @@ LAN_BRIDGE="br-lan"
 WG_IF="wg-yt"
 ROUTER_DNS_IP=""               # router LAN DNS IP; auto-detected from LAN_BRIDGE if empty
 
+# EDNS Client Subnet: 1 = forward the real client IP to the upstream
+# (Technitium) so its query logs show the originating client instead of the
+# router. 0 = original behaviour (queries appear to come from the router).
+DNS_ECS="0"
+
 WG_MTU="1440"                  # tunnel MTU; 1440 suits a 1500 (baby-jumbo) PPPoE WAN (1500-60). Use 1432 on a 1492 WAN.
 WG_KEEPALIVE="25"
 
@@ -31,6 +36,9 @@ EXCLUDE_SET="yt-src-exclude"
 
 YT_BACKUP_FILE="/cfg/yt-vpn.backup"
 EXCLUDE_FILE="/cfg/yt-src-exclude.list"   # optional, one IPv4 per line
+
+ECS_CONFDIR="/etc/dnsmasq.d"              # persistent dnsmasq include dir for ECS
+ECS_CONF_FILE="$ECS_CONFDIR/yt-vpn-ecs.conf"
 
 FWU_BEGIN="# --- YT_VPN_WG_YT_SETUP BEGIN ---"
 FWU_END="# --- YT_VPN_WG_YT_SETUP END ---"
@@ -143,6 +151,14 @@ print_status() {
   if uci show "$DNSMASQ_SECTION".ipset 2>/dev/null | grep -q "$YT_SET"; then DNS_IPSET_OK="PRESENT"; else DNS_IPSET_OK="MISSING"; fi
   if grep -q "$FWU_BEGIN" /etc/firewall.user 2>/dev/null; then FWU_OK="PRESENT"; else FWU_OK="MISSING"; fi
 
+  ecs_cur="$(uci -q get "$DNSMASQ_SECTION".confdir || true)"
+  if { [ -n "$ecs_cur" ] && grep -rqs 'add-subnet' "$ecs_cur" 2>/dev/null; } || \
+     grep -qs 'add-subnet' "$ECS_CONF_FILE" 2>/dev/null; then
+    ECS_OK="ON"
+  else
+    ECS_OK="OFF"
+  fi
+
   if ipset list "$YT_SET" >/dev/null 2>&1; then
     YT_COUNT="$(ipset list "$YT_SET" | awk '/^Number of entries:/{print $4}')"
     [ -n "$YT_COUNT" ] || YT_COUNT=0
@@ -158,6 +174,7 @@ print_status() {
   printf "%-34s %s\n" "Routing table $RT_TABLE_NAME:" "$RT_OK"
   printf "%-34s %s\n" "Mangle PREROUTING:" "$(status_mangle)"
   printf "%-34s %s\n" "dnsmasq ipset config:" "$DNS_IPSET_OK"
+  printf "%-34s %s\n" "EDNS Client Subnet (ECS):" "$ECS_OK"
   printf "%-34s %s\n" "$YT_SET entries:" "$YT_COUNT"
   printf "%-34s %s\n" "/etc/firewall.user block:" "$FWU_OK"
   echo "===================================================="
@@ -250,6 +267,45 @@ ensure_wg() {
   wg set "$WG_IF" peer "$WG_SERVER_PUBKEY" persistent-keepalive "$WG_KEEPALIVE"
 }
 
+ensure_ecs() {
+  local cur target
+  cur="$(uci -q get "$DNSMASQ_SECTION".confdir || true)"
+
+  if [ "${DNS_ECS:-0}" = "1" ]; then
+    # Refuse to enable if this dnsmasq build can't parse the option, rather
+    # than letting the restart fail and take DNS down.
+    if ! dnsmasq --test --conf-file=/dev/null --add-subnet=32,128 >/dev/null 2>&1; then
+      warn "dnsmasq does not support add-subnet; leaving ECS disabled."
+      return 0
+    fi
+
+    # Write the option into the conf-dir dnsmasq already reads if one is set;
+    # otherwise use a persistent /etc dir and point dnsmasq at it (so it
+    # survives reboots, unlike the default /tmp/dnsmasq.d).
+    if [ -n "$cur" ]; then
+      target="$cur"
+    else
+      target="$ECS_CONFDIR"
+      uci set "$DNSMASQ_SECTION".confdir="$ECS_CONFDIR"
+    fi
+    mkdir -p "$target"
+    printf '%s\n%s\n' "# Managed by yt-vpn-setup.sh (DNS_ECS=1)" "add-subnet=32,128" \
+      > "$target/yt-vpn-ecs.conf"
+    info "ECS enabled: client IPs forwarded to upstream as EDNS Client Subnet."
+  else
+    # Disabled: remove our managed snippet (from a custom confdir and the
+    # default location) so behaviour is identical to the original script. If
+    # we were the one who created an otherwise-empty /etc/dnsmasq.d, undo that.
+    [ -n "$cur" ] && rm -f "$cur/yt-vpn-ecs.conf"
+    rm -f "$ECS_CONF_FILE"
+    if [ "$cur" = "$ECS_CONFDIR" ] && [ -d "$ECS_CONFDIR" ] && \
+       [ -z "$(ls -A "$ECS_CONFDIR" 2>/dev/null)" ]; then
+      uci del "$DNSMASQ_SECTION".confdir 2>/dev/null || true
+      rmdir "$ECS_CONFDIR" 2>/dev/null || true
+    fi
+  fi
+}
+
 ensure_dnsmasq_config() {
   validate_ipv4 "$TECHNITIUM_IP" || die "TECHNITIUM_IP is invalid: $TECHNITIUM_IP"
 
@@ -272,6 +328,8 @@ ensure_dnsmasq_config() {
   # Static assets (thumbnails, avatars) — optional, for a fully coherent path.
   uci add_list "$DNSMASQ_SECTION".ipset='/ytimg.com/yt-vpn'
   uci add_list "$DNSMASQ_SECTION".ipset='/ggpht.com/yt-vpn'
+
+  ensure_ecs
 
   uci commit dhcp
   /etc/init.d/dnsmasq restart

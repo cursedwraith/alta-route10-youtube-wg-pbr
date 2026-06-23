@@ -53,11 +53,19 @@ NORESOLV="$(uci -q get $DNSMASQ_SEC.noresolv)"
 RESOLVFILE="$(uci -q get $DNSMASQ_SEC.resolvfile)"
 SERVERS="$(uci show $DNSMASQ_SEC.server 2>/dev/null | sed -e "s/^$DNSMASQ_SEC.server=//")"
 IPSET_RULES="$(uci show $DNSMASQ_SEC.ipset 2>/dev/null | sed -e "s/^$DNSMASQ_SEC.ipset=//")"
+CONFDIR="$(uci -q get $DNSMASQ_SEC.confdir)"
+if { [ -n "$CONFDIR" ] && grep -rqs 'add-subnet' "$CONFDIR" 2>/dev/null; } || \
+   grep -qs 'add-subnet' /etc/dnsmasq.d/yt-vpn-ecs.conf 2>/dev/null; then
+  ECS_STATE="ON (client IP sent upstream as EDNS Client Subnet)"
+else
+  ECS_STATE="OFF (queries appear to come from the router)"
+fi
 
 kv "noresolv" "${NORESOLV:-<unset>}"
 kv "resolvfile" "${RESOLVFILE:-<unset>}"
 kv "upstream server list" "${SERVERS:-<none>}"
 kv "ipset domain rules" "${IPSET_RULES:-<none>}"
+kv "EDNS Client Subnet (ECS)" "$ECS_STATE"
 
 # --- ipset stats ---
 hr

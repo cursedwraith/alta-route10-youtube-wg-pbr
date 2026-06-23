@@ -213,6 +213,30 @@ Client -> Router dnsmasq -> Technitium -> Internet
 
 Avoid pointing clients directly to Technitium if you want the router to populate `yt-vpn`.
 
+### Seeing real client IPs in Technitium (optional)
+
+Because dnsmasq forwards as itself, Technitium logs every query as coming from
+the router (`192.168.1.1`). To make the originating client visible without
+breaking the ipset/PBR pipeline, enable EDNS Client Subnet in the config block:
+
+```sh
+DNS_ECS="1"     # 0 = original behaviour (queries appear to come from the router)
+```
+
+When enabled, the script adds `add-subnet=32,128` to dnsmasq (in a persistent
+`/etc/dnsmasq.d` include, or your existing `confdir` if one is set), so each
+forwarded query carries the real client IP as EDNS Client Subnet. On the
+Technitium side, enable **EDNS Client Subnet (ECS)** and use the **Query Logs
+(SQLite)** app — the originating client appears in the *Client Subnet* field.
+
+Notes:
+
+- Setting `DNS_ECS="0"` and re-running removes the option and restores the
+  exact original behaviour (it also cleans up an `/etc/dnsmasq.d` it created).
+- ECS exposes client IPs to whatever Technitium forwards to. With a recursive
+  local Technitium this stays internal; don't let it propagate ECS to public
+  upstreams.
+
 ---
 
 ## Server-Side WireGuard Requirements
