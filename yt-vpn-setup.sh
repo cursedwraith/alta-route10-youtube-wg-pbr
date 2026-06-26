@@ -40,6 +40,8 @@ EXCLUDE_FILE="/cfg/yt-src-exclude.list"   # optional, one IPv4 per line
 ECS_CONFDIR="/etc/dnsmasq.d"              # persistent dnsmasq include dir for ECS
 ECS_CONF_FILE="$ECS_CONFDIR/yt-vpn-ecs.conf"
 
+LOG_FILE="/cfg/yt-vpn.log"               # --auto/--repair append a timestamped line here
+
 FWU_BEGIN="# --- YT_VPN_WG_YT_SETUP BEGIN ---"
 FWU_END="# --- YT_VPN_WG_YT_SETUP END ---"
 ### ==============================
@@ -427,11 +429,72 @@ full_setup() {
   info "Server peer must allow router address $WG_ADDR and router public key from: wg show $WG_IF"
 }
 
+log_line() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+# Return 0 (true) when something the Alta controller can reset is missing, so a
+# repair is warranted. Deliberately does NOT consider the wg-yt interface,
+# which survives controller pushes and self-heals via keepalive.
+needs_repair() {
+  [ "$(uci -q get "$DNSMASQ_SECTION".noresolv)" = "1" ] || return 0
+  uci -q get "$DNSMASQ_SECTION".server 2>/dev/null | grep -q "$TECHNITIUM_IP" || return 0
+  uci show "$DNSMASQ_SECTION".ipset 2>/dev/null | grep -q "$YT_SET" || return 0
+  if [ "${DNS_ECS:-0}" = "1" ]; then
+    [ "$(uci -q get "$DNSMASQ_SECTION".confdir)" = "$ECS_CONFDIR" ] || return 0
+  fi
+  grep -q "$FWU_BEGIN" /etc/firewall.user 2>/dev/null || return 0
+  ip rule show | grep -q "fwmark $FWMARK lookup $RT_TABLE_NAME" || return 0
+  ip route show table "$RT_TABLE_NAME" 2>/dev/null | grep -q "default dev $WG_IF" || return 0
+  ipset list "$YT_SET" >/dev/null 2>&1 || return 0
+  return 1
+}
+
+# Non-interactive repair for cron. Re-applies only what's missing; rebuilds the
+# tunnel only if the interface is actually gone (so a working session isn't torn
+# down). Cheap no-op when everything is healthy.
+auto_repair() {
+  check_deps
+  validate_config
+  if ! needs_repair; then
+    [ "${LOG_OK:-0}" = "1" ] && log_line "ok (no change)"
+    info "Healthy; no changes."
+    return 0
+  fi
+  save_current_cache
+  ip link show "$WG_IF" >/dev/null 2>&1 || ensure_wg
+  ensure_rt_table
+  ensure_ipsets
+  ensure_dnsmasq_config
+  ensure_firewall_user
+  restore_cache
+  log_line "repaired YT-over-VPN config (was reset, e.g. by an Alta web-UI change)"
+  info "Repaired."
+}
+
+usage() {
+  cat <<EOF
+Usage: $0 [--auto|--repair] [--status] [--help]
+  (no args)      interactive: show status, prompt to (re)configure
+  --auto         non-interactive: repair only if config was reset (for cron)
+  --repair       alias for --auto
+  --status       print status and exit
+EOF
+}
+
 main() {
   local ans
   need_root
   DNSMASQ_SECTION="$(find_dnsmasq_section)"
   [ -n "$DNSMASQ_SECTION" ] || die "Could not find dnsmasq UCI section."
+
+  case "${1:-}" in
+    --auto|--repair) auto_repair; return ;;
+    --status)        print_status; return ;;
+    --help|-h)       usage; return ;;
+    "")              ;;
+    *)               usage; die "Unknown option: $1" ;;
+  esac
 
   print_status
 

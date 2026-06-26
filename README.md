@@ -494,6 +494,55 @@ It cannot reliably identify full encrypted URLs without TLS interception.
 
 ---
 
+## Auto-repair (Alta web-UI resets)
+
+The Alta cloud controller regenerates `/etc/config/dhcp`, `/etc/config/firewall`
+and `/etc/config/network` whenever you change a firewall or DNS setting in the
+Alta web UI. That wipes the UCI settings this script applies (Technitium
+upstream, `noresolv=1`, the `ipset=` rules, and the ECS `confdir`), which breaks
+YouTube routing and ECS until the script is run again. The `wg-yt` interface and
+the file-based parts (`/etc/firewall.user`, the ECS include) survive — only the
+UCI parts are lost.
+
+To self-heal, run the script in non-interactive repair mode from cron:
+
+```sh
+# every 3 minutes: re-apply only if the controller reset something
+echo '*/3 * * * * /cfg/yt-vpn-setup.sh --auto' >> /etc/crontabs/root
+/etc/init.d/cron enable
+/etc/init.d/cron restart
+```
+
+`--auto` is a cheap no-op when everything is healthy; when it detects a reset it
+re-applies the missing config (without tearing down a working tunnel) and
+appends a timestamped line to `/cfg/yt-vpn.log`. Other modes:
+
+```sh
+/cfg/yt-vpn-setup.sh --status     # print status and exit
+/cfg/yt-vpn-setup.sh --repair     # alias for --auto
+```
+
+Note: this firmware has no running syslog (`logread` reports no buffer), so
+`/cfg/yt-vpn.log` is your record of when a reset happened and was repaired.
+Each Alta web-UI firewall/DNS change will cause a brief break until the next
+cron run repairs it, so avoid making such changes more often than necessary.
+
+For near-instant repair instead of polling, if your BusyBox includes
+`inotifyd` you can trigger on config change via a small wrapper (`inotifyd`
+calls its handler with `EVENT FILE` arguments, so it can't invoke `--auto`
+directly):
+
+```sh
+cat > /cfg/yt-vpn-inotify.sh <<'EOF'
+#!/bin/sh
+/cfg/yt-vpn-setup.sh --auto
+EOF
+chmod +x /cfg/yt-vpn-inotify.sh
+inotifyd /cfg/yt-vpn-inotify.sh /etc/config/dhcp:w &
+```
+
+---
+
 ## Disclaimer
 
 This is an unofficial community script.
