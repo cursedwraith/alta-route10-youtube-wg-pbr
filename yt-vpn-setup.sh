@@ -23,7 +23,7 @@ ROUTER_DNS_IP=""               # router LAN DNS IP; auto-detected from LAN_BRIDG
 # router. 0 = original behaviour (queries appear to come from the router).
 DNS_ECS="0"
 
-WG_MTU="1440"                  # tunnel MTU; 1440 suits a 1500 (baby-jumbo) PPPoE WAN (1500-60). Use 1432 on a 1492 WAN.
+WG_MTU="1380"                  # tunnel MTU; safe default for 1492 PPPoE WAN (1492-60=1432 ceiling; 1380 adds margin). Raise to 1420 only if no buffering.
 WG_KEEPALIVE="25"
 
 RT_TABLE_NAME="wgroute"
